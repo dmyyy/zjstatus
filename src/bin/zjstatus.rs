@@ -1,4 +1,6 @@
 use zellij_tile::prelude::*;
+#[cfg(not(test))]
+use zellij_tile::shim::run_command_with_env_variables_and_cwd;
 
 use chrono::Local;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
@@ -23,11 +25,20 @@ use zjstatus::{
 // Matches the old incidental Zellij session scan cadence.
 const REFRESH_INTERVAL_SECONDS: f64 = 1.0;
 
+const ACTIVE_PROJECT_COLOR_COMMAND: &str = "zjstatus_active_project_color";
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProjectColorKey {
+    cwd: PathBuf,
+    tab_name: String,
+}
+
 #[derive(Default)]
 struct State {
     pending_events: Vec<Event>,
     got_permissions: bool,
     state: ZellijState,
+    active_project_color_key: Option<ProjectColorKey>,
+    active_project_color_request: Option<ProjectColorKey>,
     userspace_configuration: BTreeMap<String, String>,
     module_config: config::ModuleConfig,
     widget_map: BTreeMap<String, Arc<dyn Widget>>,
@@ -111,7 +122,10 @@ impl ZellijPlugin for State {
             incoming_notification: None,
             focused_pane_id: None,
             focused_pane_cwd: None,
+            active_project_color: None,
         };
+        self.active_project_color_key = None;
+        self.active_project_color_request = None;
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
@@ -186,7 +200,7 @@ impl ZellijPlugin for State {
 }
 
 impl State {
-    fn update_focused_pane(&mut self) {
+    fn update_focused_pane(&mut self, check_project_color: bool) {
         let active_tab = self.state.tabs.iter().find(|t| t.active);
 
         let new_id = active_tab
@@ -195,6 +209,7 @@ impl State {
             .map(|p| PaneId::Terminal(p.id));
 
         if new_id == self.state.focused_pane_id {
+            self.refresh_active_project_color(check_project_color);
             return;
         }
 
@@ -211,7 +226,9 @@ impl State {
             None => None,
         };
 
-        self.set_focused_pane_cwd(new_cwd);
+        if !self.set_focused_pane_cwd(new_cwd) {
+            self.refresh_active_project_color(check_project_color);
+        }
     }
 
     fn set_focused_pane_cwd(&mut self, new_cwd: Option<PathBuf>) -> bool {
@@ -221,12 +238,84 @@ impl State {
 
         self.state.focused_pane_cwd = new_cwd;
 
-        if self.focus_cwd_commands.is_empty() {
-            return false;
+        self.invalidate_focus_cwd_commands();
+        self.refresh_active_project_color(false);
+        true
+    }
+
+    // Rechecks on tab updates so external color changes appear without a project change.
+    fn refresh_active_project_color(&mut self, check_current_color: bool) {
+        let project = self.active_project_color_key();
+
+        if self.active_project_color_key.as_ref() != project.as_ref() {
+            self.state.active_project_color = None;
+            self.active_project_color_key = None;
         }
 
-        self.invalidate_focus_cwd_commands();
-        true
+        let Some(project) = project else {
+            return;
+        };
+
+        if self.active_project_color_request.as_ref() == Some(&project)
+            || (!check_current_color && self.active_project_color_key.as_ref() == Some(&project))
+        {
+            return;
+        }
+
+        self.active_project_color_request = Some(project.clone());
+        self.lookup_active_project_color(&project);
+    }
+
+    fn active_project_color_key(&self) -> Option<ProjectColorKey> {
+        Some(ProjectColorKey {
+            cwd: self.state.focused_pane_cwd.clone()?,
+            tab_name: self.active_tab_name()?.to_owned(),
+        })
+    }
+
+    // Rebuilds a request key from Zellij's command-result context.
+    fn project_color_key_from_context(
+        context: &BTreeMap<String, String>,
+    ) -> Option<ProjectColorKey> {
+        Some(ProjectColorKey {
+            cwd: PathBuf::from(context.get("cwd")?),
+            tab_name: context.get("project_name")?.clone(),
+        })
+    }
+
+    fn active_tab_name(&self) -> Option<&str> {
+        self.state
+            .tabs
+            .iter()
+            .find(|tab| tab.active)
+            .map(|tab| tab.name.as_str())
+    }
+
+    // Runs the user-defined lookup with the key needed to reject stale results.
+    fn lookup_active_project_color(&self, project: &ProjectColorKey) {
+        #[cfg(test)]
+        let _ = project;
+
+        #[cfg(not(test))]
+        {
+            let context = BTreeMap::from([
+                ("name".to_owned(), ACTIVE_PROJECT_COLOR_COMMAND.to_owned()),
+                ("cwd".to_owned(), project.cwd.to_string_lossy().into_owned()),
+                ("project_name".to_owned(), project.tab_name.clone()),
+            ]);
+
+            run_command_with_env_variables_and_cwd(
+                &[
+                    "fish",
+                    "-c",
+                    "get_project_color $argv[1]",
+                    &project.tab_name,
+                ],
+                BTreeMap::new(),
+                project.cwd.clone(),
+                context,
+            );
+        }
     }
 
     fn invalidate_focus_cwd_commands(&mut self) {
@@ -281,7 +370,7 @@ impl State {
                 self.state.panes = pane_info;
                 self.state.cache_mask = UpdateEventMask::Tab as u8;
 
-                self.update_focused_pane();
+                self.update_focused_pane(false);
 
                 should_render = true;
             }
@@ -292,7 +381,8 @@ impl State {
                 if Some(pane_id) == self.state.focused_pane_id
                     && self.set_focused_pane_cwd(Some(cwd))
                 {
-                    self.state.cache_mask = UpdateEventMask::Command as u8;
+                    self.state.cache_mask =
+                        UpdateEventMask::Tab as u8 | UpdateEventMask::Command as u8;
                     should_render = true;
                 }
             }
@@ -309,6 +399,43 @@ impl State {
                     stderr = ?String::from_utf8(stderr.clone()),
                     context = ?context
                 );
+
+                if context
+                    .get("name")
+                    .is_some_and(|name| name == ACTIVE_PROJECT_COLOR_COMMAND)
+                {
+                    let Some(project) = Self::project_color_key_from_context(&context) else {
+                        return false;
+                    };
+                    if self.active_project_color_request.as_ref() == Some(&project) {
+                        self.active_project_color_request = None;
+                    }
+                    if self.active_project_color_key() != Some(project.clone()) {
+                        tracing::debug!("discarding stale active project color result");
+                        return false;
+                    }
+
+                    let expected_color = match exit_code {
+                        Some(1) => Some(anstyle::RgbColor(255, 93, 253).into()),
+                        Some(0) => String::from_utf8(stdout).ok().and_then(|stdout| {
+                            zjstatus::render::parse_color(
+                                stdout.trim(),
+                                &self.userspace_configuration,
+                            )
+                        }),
+                        _ => None,
+                    };
+                    if self.state.active_project_color == expected_color {
+                        return false;
+                    }
+
+                    self.state.active_project_color = expected_color;
+                    self.active_project_color_key =
+                        self.state.active_project_color.as_ref().map(|_| project);
+                    self.state.cache_mask = UpdateEventMask::Tab as u8;
+
+                    return true;
+                }
 
                 self.state.cache_mask = UpdateEventMask::Command as u8;
 
@@ -374,6 +501,7 @@ impl State {
 
                 self.state.cache_mask = UpdateEventMask::Tab as u8;
                 self.state.tabs = tab_info;
+                self.update_focused_pane(true);
 
                 should_render = true;
             }
@@ -426,6 +554,35 @@ fn register_widgets(configuration: &BTreeMap<String, String>) -> BTreeMap<String
 mod test {
     use super::*;
 
+    fn project_color_state(project_name: &str) -> State {
+        let mut state = State::default();
+        state.state.focused_pane_cwd = Some(PathBuf::from("/project"));
+        state.state.tabs = vec![TabInfo {
+            active: true,
+            name: project_name.to_owned(),
+            ..TabInfo::default()
+        }];
+        state
+    }
+
+    fn project_color_result(
+        cwd: &str,
+        project_name: &str,
+        exit_code: Option<i32>,
+        stdout: Vec<u8>,
+    ) -> Event {
+        Event::RunCommandResult(
+            exit_code,
+            stdout,
+            Vec::new(),
+            BTreeMap::from([
+                ("name".to_owned(), ACTIVE_PROJECT_COLOR_COMMAND.to_owned()),
+                ("cwd".to_owned(), cwd.to_owned()),
+                ("project_name".to_owned(), project_name.to_owned()),
+            ]),
+        )
+    }
+
     #[test]
     fn set_focused_pane_cwd_only_invalidates_on_change() {
         let mut state = State {
@@ -461,5 +618,139 @@ mod test {
             state.state.command_results["command_branch"].context["timestamp"],
             original_timestamp
         );
+    }
+
+    #[test]
+    fn matching_project_color_result_updates_active_project_color() {
+        let mut state = project_color_state("project");
+
+        assert!(state.handle_event(project_color_result(
+            "/project",
+            "project",
+            Some(0),
+            b" #c77dff\n".to_vec(),
+        )));
+        assert_eq!(
+            state.state.active_project_color,
+            Some(anstyle::RgbColor(199, 125, 255).into())
+        );
+        assert_eq!(state.state.cache_mask, UpdateEventMask::Tab as u8);
+    }
+
+    #[test]
+    fn refresh_project_color_retains_only_the_active_tab_color() {
+        let mut state = project_color_state("project");
+        let color = anstyle::RgbColor(199, 125, 255).into();
+
+        assert!(state.handle_event(project_color_result(
+            "/project",
+            "project",
+            Some(0),
+            b"#c77dff".to_vec(),
+        )));
+        state.refresh_active_project_color(false);
+        assert_eq!(state.state.active_project_color, Some(color));
+
+        state.state.tabs[0].name = "other-project".to_owned();
+        state.refresh_active_project_color(false);
+        assert_eq!(state.state.active_project_color, None);
+    }
+
+    #[test]
+    fn refresh_project_color_deduplicates_matching_lookup() {
+        let mut state = project_color_state("project");
+
+        state.refresh_active_project_color(false);
+        let request = state.active_project_color_request.clone();
+        state.refresh_active_project_color(false);
+
+        assert_eq!(state.active_project_color_request, request);
+    }
+
+    #[test]
+    fn tab_update_rechecks_the_active_project_color() {
+        let mut state = project_color_state("project");
+
+        assert!(state.handle_event(project_color_result(
+            "/project",
+            "project",
+            Some(0),
+            b"#c77dff".to_vec(),
+        )));
+        let tabs = state.state.tabs.clone();
+        assert!(state.handle_event(Event::TabUpdate(tabs)));
+
+        assert_eq!(
+            state.active_project_color_request,
+            Some(ProjectColorKey {
+                cwd: PathBuf::from("/project"),
+                tab_name: "project".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn unchanged_project_color_result_does_not_render() {
+        let mut state = project_color_state("project");
+        state.state.active_project_color = Some(anstyle::RgbColor(199, 125, 255).into());
+        state.active_project_color_key = state.active_project_color_key();
+        state.state.cache_mask = 0;
+
+        assert!(!state.handle_event(project_color_result(
+            "/project",
+            "project",
+            Some(0),
+            b"#c77dff".to_vec(),
+        )));
+        assert_eq!(state.state.cache_mask, 0);
+    }
+
+    #[test]
+    fn missing_project_exit_code_uses_default_normal_color() {
+        let mut state = project_color_state("project");
+
+        assert!(state.handle_event(project_color_result(
+            "/project",
+            "project",
+            Some(1),
+            Vec::new(),
+        )));
+        assert_eq!(
+            state.state.active_project_color,
+            Some(anstyle::RgbColor(255, 93, 253).into())
+        );
+    }
+
+    #[test]
+    fn stale_project_color_result_is_ignored() {
+        let mut state = project_color_state("current-project");
+        state.state.active_project_color = Some(anstyle::RgbColor(199, 125, 255).into());
+
+        assert!(!state.handle_event(project_color_result(
+            "/project",
+            "old-project",
+            Some(0),
+            b"#00ff00".to_vec(),
+        )));
+        assert_eq!(
+            state.state.active_project_color,
+            Some(anstyle::RgbColor(199, 125, 255).into())
+        );
+    }
+
+    #[test]
+    fn failed_or_invalid_project_color_result_clears_active_project_color() {
+        let mut state = project_color_state("project");
+
+        for event in [
+            project_color_result("/project", "project", Some(2), b"#c77dff".to_vec()),
+            project_color_result("/project", "project", Some(0), b"not-a-color".to_vec()),
+        ] {
+            state.state.active_project_color = Some(anstyle::RgbColor(199, 125, 255).into());
+
+            assert!(state.handle_event(event));
+            assert_eq!(state.state.active_project_color, None);
+            assert_eq!(state.state.cache_mask, UpdateEventMask::Tab as u8);
+        }
     }
 }

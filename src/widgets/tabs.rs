@@ -151,8 +151,8 @@ impl Widget for TabsWidget {
         }
 
         for tab in &tabs {
-            let content = self.render_tab(tab, &state.panes, &state.mode);
-            counter += 1;
+            let content =
+                self.render_tab(tab, &state.panes, &state.mode, state.active_project_color);
 
             output = format!("{}{}", output, content);
 
@@ -212,7 +212,8 @@ impl Widget for TabsWidget {
         for tab in &tabs {
             counter += 1;
 
-            let mut rendered_content = self.render_tab(tab, &state.panes, &state.mode);
+            let mut rendered_content =
+                self.render_tab(tab, &state.panes, &state.mode, state.active_project_color);
 
             if counter < tabs.len()
                 && let Some(sep) = &self.separator
@@ -296,13 +297,19 @@ impl TabsWidget {
         &self.normal_tab_format
     }
 
-    fn render_tab(&self, tab: &TabInfo, panes: &PaneManifest, mode: &ModeInfo) -> String {
+    fn render_tab(
+        &self,
+        tab: &TabInfo,
+        panes: &PaneManifest,
+        mode: &ModeInfo,
+        active_project_color: Option<anstyle::Color>,
+    ) -> String {
         let formatters = self.select_format(tab, mode);
+
         let mut output = "".to_owned();
 
         for f in formatters.iter() {
             let mut content = f.content.clone();
-
             let tab_name = match mode.mode {
                 InputMode::RenameTab => match tab.name.is_empty() {
                     true => "Enter name...",
@@ -310,10 +317,6 @@ impl TabsWidget {
                 },
                 _name => tab.name.as_str(),
             };
-
-            if content.contains("{name}") {
-                content = content.replace("{name}", tab_name);
-            }
 
             if content.contains("{index}") {
                 let index = match self.tab_zero_based_index {
@@ -348,7 +351,17 @@ impl TabsWidget {
 
             content = self.replace_indicators(content, tab, panes);
 
-            output = format!("{}{}", output, f.format_string(&content));
+            // Project colors override the active tab foreground.
+            let rendered = match (tab.active, active_project_color) {
+                (true, Some(active_project_color)) => {
+                    let mut formatter = f.clone();
+                    formatter.fg = Some(active_project_color);
+                    formatter.format_string(&content.replace("{name}", tab_name))
+                }
+                _ => f.format_string(&content.replace("{name}", tab_name)),
+            };
+
+            output.push_str(&rendered);
         }
 
         output.to_owned()
@@ -460,9 +473,12 @@ pub fn get_tab_window(
 
 #[cfg(test)]
 mod test {
+    use std::collections::BTreeMap;
+
+    use crate::{config::ZellijState, render::FormattedPart, widgets::widget::Widget};
     use zellij_tile::prelude::TabInfo;
 
-    use super::get_tab_window;
+    use super::{TabsWidget, get_tab_window};
     use rstest::rstest;
 
     #[rstest]
@@ -838,5 +854,65 @@ mod test {
         let res = get_tab_window(&tabs, max_count);
 
         assert_eq!(res, expected);
+    }
+
+    #[test]
+    fn project_color_styles_complete_active_tab() {
+        let config = BTreeMap::from([
+            (
+                "tab_active".to_owned(),
+                "fg=red]A{index}|{name}|Z".to_owned(),
+            ),
+            (
+                "tab_normal".to_owned(),
+                "fg=blue]N{index}|{name}|X".to_owned(),
+            ),
+        ]);
+        let widget = TabsWidget::new(&config);
+        let state = ZellijState {
+            active_project_color: Some(anstyle::RgbColor(199, 125, 255).into()),
+            tabs: vec![
+                TabInfo {
+                    active: true,
+                    name: "active".to_owned(),
+                    position: 0,
+                    ..TabInfo::default()
+                },
+                TabInfo {
+                    active: false,
+                    name: "inactive".to_owned(),
+                    position: 1,
+                    ..TabInfo::default()
+                },
+            ],
+            ..ZellijState::default()
+        };
+
+        let active_formatter = FormattedPart::from_format_string(&config["tab_active"], &config);
+        let mut project_tab_formatter = active_formatter.clone();
+        project_tab_formatter.fg = Some(anstyle::RgbColor(199, 125, 255).into());
+        let normal_formatter = FormattedPart::from_format_string(&config["tab_normal"], &config);
+
+        assert_eq!(
+            widget.process("tabs", &state),
+            format!(
+                "{}{}",
+                project_tab_formatter.format_string("A1|active|Z"),
+                normal_formatter.format_string("N2|inactive|X"),
+            )
+        );
+
+        let fallback_state = ZellijState {
+            active_project_color: None,
+            ..state
+        };
+        assert_eq!(
+            widget.process("tabs", &fallback_state),
+            format!(
+                "{}{}",
+                active_formatter.format_string("A1|active|Z"),
+                normal_formatter.format_string("N2|inactive|X"),
+            )
+        );
     }
 }

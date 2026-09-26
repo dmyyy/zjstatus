@@ -308,7 +308,7 @@ fn hex_to_rgb(s: &str) -> anyhow::Result<Vec<u8>> {
     create = "{ LruCache::builder().max_size(100).build().unwrap() }",
     convert = r#"{ (color.to_owned()) }"#
 )]
-fn parse_color(color: &str, config: &BTreeMap<String, String>) -> Option<Color> {
+pub fn parse_color(color: &str, config: &BTreeMap<String, String>) -> Option<Color> {
     let mut color = color;
     if color.starts_with('$') {
         let alias_name = color.strip_prefix('$').unwrap();

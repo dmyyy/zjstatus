@@ -26,6 +26,7 @@ pub struct ZellijState {
     pub cache_mask: u8,
     pub focused_pane_id: Option<PaneId>,
     pub focused_pane_cwd: Option<std::path::PathBuf>,
+    pub active_project_color: Option<anstyle::Color>,
 }
 
 #[derive(Clone, Debug, Ord, Eq, PartialEq, PartialOrd, Copy)]
